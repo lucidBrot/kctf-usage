@@ -19,6 +19,24 @@ You already have a docker that runs your ctf challenge, and want to use it in kc
   * specify it correctly in `challenge.yaml` as well, see [this kctf github issue](https://github.com/google/kctf/issues/388#issuecomment-1335660783) for an example where exactly to specify this. It is in `spec.podTemplate.template.spec.containers.securityContext`.
   * Sometimes it seemed to me that I also needed `privileged: true` when it complained about readonly filesystem.
 
+Aside from those worries, you will also need to have kctf-related scripts and nsjail in the docker. The easiest ways to do so is to give your currently built stage a name in the Dockerfile (see [docker multistage builds](https://docs.docker.com/build/building/multi-stage/)) and then start a new final stage where you copy everything over to the image the kctf examples use, e.g. the [pwn example](https://github.com/google/kctf/blob/v1/dist/challenge-templates/pwn/challenge/Dockerfile#L23). Or take the latest from `gcr.io/kctf-docker/challenge`, i guess.
+
+```Dockerfile
+FROM some_image as chroot
+# your challenge dockerfile stuff here.
+
+FROM gcr.io/kctf-docker/challenge@sha256:eb0f8c3b97460335f9820732a42702c2fa368f7d121a671c618b45bbeeadab28 as kctfstage
+COPY --from=chroot / /chroot
+COPY nsjail.cfg /home/user
+CMD kctf_setup && \
+    kctf_drop_privs \
+    socat \
+      TCP-LISTEN:1337,reuseaddr,fork \
+      EXEC:"kctf_pow nsjail --config /home/user/nsjail.cfg -- /home/user/chal"
+```
+
+In this, the `nsjail` launches the challenge binary at `/home/user/chal` . You might wonder "But the `chal` binary is *actually* at `/chroot/home/user/chal`?!".  That is true, but the `nsjail.cfg` contains a [config](https://github.com/google/kctf/blob/v1/dist/challenge-templates/pwn/challenge/nsjail.cfg#L32) that mounts the `/chroot` (as seen from the docker container perspective) to `/` (as seen from inside the nsjail).
+
 ## run a kctf challenge without kubernetes
 
 `kctf`  has an option to simulate a local "kind" kubernetes cluster. But you can also just launch your docker almost normally. It will usually need `--privileged`, but that is okay because the docker is not what is ensuring the security anyway.
@@ -27,6 +45,10 @@ You already have a docker that runs your ctf challenge, and want to use it in kc
 docker build -t myimage .
 docker run --privileged -p1337:1337 -it myimage
 ```
+
+This is nice for a small deployment with few anticipated users, as it still has nsjail but no scaling kubernetes stuff.
+
+But if you are planning to eventually use kubernetes for the CTF event, then please do first test it at least in kind, if not on the cloud already. I had the experience that GKE and Kind behave differently. E.g. I can access one challenge from another using kind, but not GKE.
 
 ## allow network access from the jail to the outside
 
@@ -74,3 +96,10 @@ Luckily my poc setup for getting sudo to run in nsjail (I have not yet run it in
 * My poc is based on ubuntu 18
 * basing the chroot on python-alpine fails with new errors. Not recommendable.
 * the python-slim and python base images seem to have locked the root account, so sudo fails when run as root.
+
+## expose multiple ports
+
+The easiest way to deal with this is to redesign the challenge. The second easiest way is to make the challenge contain a "jumpbox" shell from where the ctf player can operate. Because, well... there is just no way in kctf to reliably get traffic to the same instance through different tcp connections. And even if you do, it would then not reach the nsjail instance, unless you decided to go without nsjail.
+
+But for some reason, [it is configurable anyway](https://github.com/google/kctf/tree/v1/dist/challenge-templates/pwn#challengeyaml), so maybe i am wrong.
+
