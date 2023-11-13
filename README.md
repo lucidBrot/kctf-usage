@@ -109,7 +109,49 @@ CMD kctf_setup && \
       EXEC:"kctf_pow nsjail --config /kctf/nsjail.cfg -- /kctf/unsocat.sh"
 ```
 
+### Listen on a Port
+
 Also, my challenge would normally listen on `hostname:port`. But now, it seems the hostname is `NSJAIL` and does not resolve... so we need to add that to the `/etc/hosts` file. i do this with the line `RUN echo "127.0.0.1 NSJAIL" >> /chroot/etc/hosts` in my Dockerfile's final stage.
+
+### mount /dev/null
+
+Mounting `/dev/null` is not so hard, but if you write to it you might get `/dev/null: Permission denied`. The reason might be explained in [this great answer](https://unix.stackexchange.com/questions/619814/why-do-bind-mounts-of-device-nodes-break-with-eacces-in-root-of-a-tmpfs). ([archive link](https://archive.is/wip/Kumcl))
+
+In a very specific edge case, when `/dev` is a `tmpfs` with the sticky bit set and group- or world-writable, but the owner of `/dev/null` is neither the owner of `/dev` nor the current user, there is the problem that `echo` tries to create the file and gets denied.
+
+Now, because I was specifically mounting `/dev` as a tmpfs instead of following the example [in the kctf repo](https://github.com/google/kctf/blob/v1/dist/challenge-templates/web/challenge/web-servers.nsjail.cfg#L36), as I wanted to avoid having any devs I don't strictly need, I *did* have a tempfs. And without specifying the mount option `mode=`, the default does set the sticky bit. Due to the fact that I do not map `root` inside to `root` outside, the owner of the `/dev/null` is `nobody`, but the owner of `/dev` is my current user. We have this exact case.
+
+The fix then is to set the `/dev` permissions more like in the "real" environments, where it would be `-o mode=755`.
+
+```
+generic@motorbrot:~$ ls -la /dev/null
+crw-rw-rw- 1 root root 1, 3 Okt 26 18:55 /dev/null
+generic@motorbrot:~$ ls -la /dev/.
+total 33
+drwxr-xr-x  20 root    root            6180 Nov  7 15:46 .
+```
+
+So in `nsjail.cfg`:
+
+```
+# Allow access to /dev/null
+mount [
+  {
+    dst: "/dev"
+    fstype: "tmpfs"
+    rw: true,
+    options: "mode=755"
+  },
+  {
+    src: "/dev/null"
+    dst: "/dev/null"
+    rw: true
+    is_bind: true
+  }
+]
+```
+
+
 
 ## run a kctf challenge without kubernetes
 
@@ -160,7 +202,7 @@ The option [X-mount.mkdir](https://unix.stackexchange.com/a/635263/66736) seems 
 
 Without it, we need some pre-existing directories we can use in the overlay mount command (upperdir, lowerdir, workdir). And upperdir and workdir must be on the same filesystem to allow for atomic writing... so we must have a writable tmpfs and create two directories on it somehow. Otherwise, this config fails:
 
-```
+```cfg
 # using a tmpfs i can make an overlayfs to avoid copying
 # a large pre-made folder. I don't have any large folders,
 # but I am curious whether I can make it work.
@@ -203,7 +245,7 @@ If you change the order to the following, it works:
 kctf_pow nsjail  --config /kctf/nsjail.cfg --bindmount "${mytmpfs}:/tmp2" -- /bin/bash
 ```
 
-The `--config` apparently must come first. Probably due to the mounting of `/` in the config that comes too late otherwise? But well, this now also means that we must specify the overlay mount command itself in the command line here instead of the config. So something like this *should* work in my opinion, but it **does not work** and I'm not sure what is missing:
+The `--config` apparently must come first. Probably due to the mounting of `/` in the config that comes too late otherwise? But well, this now also means that we must specify the overlay mount command itself in the command line here instead of in the config. So something like this *should* work in my opinion, but it **does not work** and I'm not sure what is missing:
 
 ```bash
 #!/bin/bash
@@ -281,3 +323,94 @@ The easiest way to deal with this is to redesign the challenge. The second easie
 
 But for some reason, [it is configurable anyway](https://github.com/google/kctf/tree/v1/dist/challenge-templates/pwn#challengeyaml), so maybe i am wrong.
 
+## More than one User in the Jail
+
+When you want to have multiple users, you should map their user ids to existing user ids outside the jail. Otherwise, file permissions will be weird.
+
+Ideally though, no user in the jail maps to the real root user id. Because otherwise they could read the files that root can read. (Only the files they can see in the jail, at least)
+
+To map multiple user ids, we need nsjail to use [newuidmap](https://man7.org/linux/man-pages/man1/newuidmap.1.html) and we need to specify in a `/etch/subuid` file inside the container (outside the jails) which user ids may be mapped to by which user. The syntax `user:outsideUserID:N`  declares a user who may map a range from some userID up to userID+N. For Groups, a similar thing `/etc/subgid` exists. The first part (`user`) may be a userID or a username.
+
+Note that usually, you call `nsjail` after `kctf_drop_privs` which looks like this in the image they use:
+
+```bash
+#!/bin/bash
+
+# There are two copies of this file in the nsjail and healthcheck base images.
+
+all_caps="-cap_0"
+for i in $(seq 1 $(cat /proc/sys/kernel/cap_last_cap)); do
+  all_caps+=",-cap_${i}"
+done
+
+exec setpriv --init-groups --reset-env --reuid user --regid user --inh-caps=${all_caps} -- "$@"
+```
+
+So `kctf_drop_privs` makes the current user become `user`, and hence this user is the one you need to give permissions to. The user `user` (outside the nsjail) has id 1000.
+
+Usually, you'll want to map to `user`, because that makes things easier. 
+
+### Mapping the nsjail initial user to a Custom User
+
+I have files belonging to a user with id `3777` that I bind-mount into the jail. That is, you would have in `nsjail.cfg` something like this:
+
+```
+uidmap [
+    {inside_id: "1000", outside_id: "3777", use_newidmap: true},
+    {inside_id: "0", outside_id: "0", use_newidmap: true}
+]
+gidmap [
+    {inside_id: "1000", outside_id: "3777", use_newidmap: true},
+    {inside_id: "0", outside_id: "0", use_newidmap: true}
+]
+```
+
+And correspondingly in `/etc/subuid` and `/etc/subgid` the user and group id mappings allowed:
+
+```Dockerfile
+# Dockerfile:
+RUN echo "1000:3777:1\n1000:0:1" > /etc/subuid &&\
+    echo "1000:3777:1\n1000:0:1" > /etc/subgid 
+```
+
+Sidenote: it seems that `/etc/subuid` does not have to specify that a user is allowed to map to their own user id. So if you were to launch nsjail with this config as the (outside jail) user with id 3777 instead of the user with id 1000, it would still work. That can be confusing.
+
+
+
+This is a questionable design choice because:
+
+* The config above maps root inside the jail to root outside the jail. So if anyone attains root inside the jail, they can access the files they see like the real root user can.
+  ```
+  [W][2023-11-13T13:52:05+0000][20] logParams():266 Process will be UID/EUID=0 in the global user namespace, and will have user root-level access to files
+  ```
+
+  This is tangential though, I could as well have made an example without this issue.
+
+* The config above maps the user `user` (uid 1000) inside the jail to the user `edwald` (uid 3777) outside the jail. But in my challenge I want edwald to be able to access certain files. By default, everything in the docker image has permissions set up so that it will work for mounting the things `user` needs... but for other users we run into things such as this message when I was trying to mount something from a temp folder outside the jail to a temp folder inside the jail:
+  ```
+  [W][2023-11-13T13:52:05+0000][1] mountPt():217 mount(''/tmp/tmp.0zS1sNKHAL/chal' -> '/tmp/chal' flags:MS_BIND|MS_REC|MS_PRIVATE type:'' options:'' dir:true') src:'/tmp/tmp.0zS1sNKHAL/chal' dstpath:'/tmp/nsjail.1000.root//tmp/chal' failed. Try fixing this problem by applying 'chmod o+x' to the '/tmp/tmp.0zS1sNKHAL/chal' directory and its ancestors: Permission denied
+  [E][2023-11-13T13:52:05+0000][1] initCloneNs():414 Couldn't mount '/tmp/chal'
+  ```
+
+  We can debug such issues by printing `ls -lah 2>&1`  outputs to stderr in the dockerfile launch command, so we see the permissions (or use docker exec to enter the container and explore interactively).
+  In this particular case, the reason for the error message seems to be that `/tmp/tmp.0zS1sNKHAL` in the container (outside the jail) apparently belongs to `user` and has permissions `drwx------`, emphasizing the "and its ancestors" part of the error message.
+
+  Using the user `user`, we would not have this problem because the folder belongs to `user`. If we're being stubborn and want to use our custom user `edwald` instead, we need to first run `chmod o+x` for that temporary folder in a script between `kctf_drop_privs` (we now run as `user`) and before `nsjail` (we enter the jail).
+
+This solution will of course make this temporary directory listable by every user in the container. That should not be an issue, as nsjail mounts only that folder, and for each instance a separate such folder:
+
+```
+[I][2023-11-13T14:11:53+0000] Mount: '/tmp/tmp.5TT1WU4lwT/chal' -> '/tmp/chal' flags:MS_BIND|MS_REC|MS_PRIVATE type:'' options:'' dir:true
+```
+
+But still, the easier, cleaner, more maintainable way to go about this is to **keep the standard user** of the nsjail (uid 1000 inside the jail) mapped to the user `user` (uid 1000 **outside the jail**).
+
+Or at least to keep the outside user `user` and map our custom user from inside the jail to it. (Without creating a custom user in the container outside the jail).
+
+This means that the files will need to be accessible to `user` now, outside the jail. Not to `edwald`. You'll have to change some permissions. To do so, it is useful to be aware that:
+
+* You can run chown to only change files with specif user and group: `chown --from=root:root user:user -R /chroot`
+* You can copy from another docker image and specify the new owner in the same command: `COPY --from=chal --chown=user:user`
+* Any change of ownership will reset suid bits :(
+
+In some cases, modifying all the file permissions in the right way will be just as annoying as just using the different custom user.
