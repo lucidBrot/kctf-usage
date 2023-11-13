@@ -279,7 +279,7 @@ Instead of making nsjail create the overlayfs, we could also follow the approach
 
 If you drop the privs too early, mount will complain `mount: only root can use "--options" option`. This means that we will have to move the `kctf_drop_privs` command from outside the socat call to inside the command it executes. 
 
-##### Example
+##### Example on /tmp2
 
 This Dockerfile and `launch_nsjail.sh` script exerpt creates an overlayfs in the `/tmp` of the container (outside the nsjail instances), and mounts it inside the jail onto a pre-existing folder `/tmp2` (it was `/chroot/tmp2` before entering the jail).
 
@@ -309,7 +309,7 @@ trap onexit EXIT
 # This approach must be run before dropping caps with kctf_drop_privs. It calls that itself.
 # ---------
 # on each connection, we need to create an overlayfs for nsjail to mount to
-OUTSIDE_TEMP_DIR=$(mktemp -d)
+OUTSIDE_TEMP_DIR=$"mytmpfs"
 CHROOT_INSIDE="/tmp2" # TODO: actually just chroot to the whole overlayfs.
 mkdir "$OUTSIDE_TEMP_DIR/upper" "$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
 # this step is necessary to allow nsjail to mount the overlay once we drop privs
@@ -325,6 +325,61 @@ kctf_drop_privs kctf_pow nsjail --config /kctf/nsjail.cfg  \
 ```
 
 In the KNOXDEV repo, they actually just mount the overlayfs as their main chroot. That seems like a good option too, to avoid having weird paths.
+
+##### Example on /
+
+```Dockerfile
+# File: Dockerfile
+CMD kctf_setup && \
+    #kctf_drop_privs \  # Actually, I'll call this in launch_nsjail approach 3, inside socat.
+    socat \
+      TCP-LISTEN:1337,reuseaddr,fork \
+      EXEC:"/kctf/launch_nsjail.sh"
+
+```
+
+```bash
+#!/bin/bash
+# File: launch_nsjail.sh
+#!/bin/bash
+set -x
+mytmpfs=$(mktemp -d)
+mount -t tmpfs -o size=512M tmpfs "$mytmpfs"
+# if something fails, try to cleanup before exiting
+function onexit {
+    umount "$mytmpfs/fs"
+    umount "$mytmpfs"
+    rm -rf "$mytmpfs"
+    echo "$(date) : onexit done." 1>&2
+}
+trap onexit EXIT
+
+# ---------
+# Attempt 3: OverlayFS manually made, and then passed into nsjail as writable root /.
+#
+# Source: https://github.com/KNOXDEV/terraform-kubernetes-ctf-chal/blob/5d9b4e647f9769d08e6529ff8d48d86f98d861b3/docker-images/tunnelling/socat_entrypoint.sh#L3
+# This approach must be run before dropping caps with kctf_drop_privs. It calls that itself.
+# ---------
+# on each connection, we need to create an overlayfs for nsjail to mount to
+OUTSIDE_TEMP_DIR="$mytmpfs"
+mkdir "$OUTSIDE_TEMP_DIR/upper" "$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
+# this step is necessary to allow nsjail to mount the overlay once we drop privs
+chmod -R o+x "$OUTSIDE_TEMP_DIR"
+mount -t overlay overlay -o "lowerdir=/chroot,upperdir=$OUTSIDE_TEMP_DIR/upper,workdir=$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
+kctf_drop_privs kctf_pow nsjail \
+    --chroot "${OUTSIDE_TEMP_DIR}/fs" --rw \
+    --config /kctf/nsjail.cfg  \
+    --tmpfsmount /tmp \
+    --cwd "/chal" \
+    -- /bin/bash
+    #-- /kctf/unsocat.sh
+
+```
+
+We can pass `--rw` because anything written from the jail only ends up in the temporary upperdir of the overlayfs. The trap cleans that up in the end. Of course, during the connection there might still be a DOS attack by writing a huge amount of data. This can be prevented by limiting the size of the upperdir by having a separate tmpfs for every jail and limiting its size with the [mount option](https://unix.stackexchange.com/a/657222/66736), and that is the reason why my example above mounts a new tmpfs at the start.
+
+The `nsjail.cfg` for this example does *not* contain a mount for `/`.
+Notably, when I got the order of `--config` and `--chroot` wrong here it was working anyway... so i assume nsjail handles `--chroot` specially.
 
 ## allow network access from the jail to the outside
 
