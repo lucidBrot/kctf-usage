@@ -16,7 +16,7 @@ You already have a docker that runs your ctf challenge, and want to use it in kc
 * Ensure you do not need state beyond one tcp connection, because kctf might launch multiple docker instances for load-balancing and nsjail will not allow any second tcp connection to the same *jail instance* of the challenge.
 * If you want to write to the filesystem, that can be enabled, but must be done explicitly, otherwise kubernetes will just default to non-writeable filesystem.
   * set the filesystem permissions in `nsjail.cfg` to `rw: true` if you want the challenge to modify the filesystem ... but usually you don't want that, and should instead mount tmpfs filesystems. But sometimes you might need this in order to even be able to create the tmpfs mountpoint... so, good to know.
-    * Also check out the section [OverlayFS](#Alternative-OverlayFS-(Successful)) below: I explain there how to make an overlayFS that is writable and per challenge jail instance.
+    * Also check out the section [OverlayFS](#Alternative-OverlayFS-(Successful)) -- Example On Root -- below: I explain there how to make an overlayFS that is writable and per challenge jail instance.
   * specify it correctly in `challenge.yaml` as well, see [this kctf github issue](https://github.com/google/kctf/issues/388#issuecomment-1335660783) for an example where exactly to specify this. It is in `spec.podTemplate.template.spec.containers.securityContext`.
   * Sometimes it seemed to me that I also needed `privileged: true` when it complained about readonly filesystem.
 
@@ -364,8 +364,9 @@ trap onexit EXIT
 # on each connection, we need to create an overlayfs for nsjail to mount to
 OUTSIDE_TEMP_DIR="$mytmpfs"
 mkdir "$OUTSIDE_TEMP_DIR/upper" "$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
-# this step is necessary to allow nsjail to mount the overlay once we drop privs
-chmod -R o+x "$OUTSIDE_TEMP_DIR"
+# "this step is necessary to allow nsjail to mount the overlay once we drop privs" - KNOXDEV
+# But actually, i don't think that's true?
+#chmod -R o+x "$OUTSIDE_TEMP_DIR"
 mount -t overlay overlay -o "lowerdir=/chroot,upperdir=$OUTSIDE_TEMP_DIR/upper,workdir=$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
 kctf_drop_privs kctf_pow nsjail \
     --chroot "${OUTSIDE_TEMP_DIR}/fs" --rw \
