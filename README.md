@@ -411,7 +411,7 @@ More info in [docs.kernel.org](https://docs.kernel.org/userspace-api/no_new_priv
 >
 > [...] and `no_new_privs` + `chroot` is considerable less dangerous than chroot by itself.
 
-The last part sounds spooky though. Might want to be careful with this setting?
+The last part sounds spooky though. Might want to be careful with this setting? I'm [asking on serverfault](https://serverfault.com/questions/1147799/what-makes-nsjails-disable-no-new-privs-dangerous).
 
 ## get sudo to work inside nsjail
 
