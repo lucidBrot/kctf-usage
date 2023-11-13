@@ -196,7 +196,12 @@ mount {
 
 Perhaps you might also get an [OverlayFS](https://askubuntu.com/questions/699565/example-overlayfs-usage) to work, but considering that that needs a tmpfs to store the changes in anyway, you might as well just stick with a copy of the original folder.
 
-#### Making an OverlayFS (Not successful yet)
+The advantages of the OverlayFS would be:
+
+* no needless copy of large files.
+* if one of the files can only be read by root, it is easier if it can be left in place. Making a copy would require to be run as root, which can be done but has to be done before `kctf_drop_privs`, and that is supposed to happen before the call to `socat`...
+
+#### Making an OverlayFS with Nsjail (Unsuccessful)
 
 The option [X-mount.mkdir](https://unix.stackexchange.com/a/635263/66736) seems ideal to have the mount command create the missing mount points for us, but it does not work ("Invalid argument").
 
@@ -268,7 +273,58 @@ kctf_pow nsjail --config /kctf/nsjail.cfg  --bindmount "${mytmpfs}:${TMP_INSIDE}
 [E][2023-11-10T20:41:52+0000][1] initCloneNs():414 Couldn't mount '/chal'
 ```
 
-I might return later to this, but for now I will use copies instead. :(
+#### Alternative OverlayFS (Successful)
+
+Instead of making nsjail create the overlayfs, we could also follow the approach from [KNOXDEV/terraform-kubernetes-ctf-chal](https://github.com/KNOXDEV/terraform-kubernetes-ctf-chal/blob/5d9b4e647f9769d08e6529ff8d48d86f98d861b3/docker-images/tunnelling/socat_entrypoint.sh#L3) and **first make the overlayfs and then pass it in to nsjail**. 
+
+If you drop the privs too early, mount will complain `mount: only root can use "--options" option`. This means that we will have to move the `kctf_drop_privs` command from outside the socat call to inside the command it executes. 
+
+##### Example
+
+This Dockerfile and `launch_nsjail.sh` script exerpt creates an overlayfs in the `/tmp` of the container (outside the nsjail instances), and mounts it inside the jail onto a pre-existing folder `/tmp2` (it was `/chroot/tmp2` before entering the jail).
+
+```Dockerfile
+CMD kctf_setup && \
+    #kctf_drop_privs \  # Actually, I'll call this in launch_nsjail approach 3, inside socat.
+    socat \
+      TCP-LISTEN:1337,reuseaddr,fork \
+      EXEC:"/kctf/launch_nsjail.sh"
+```
+
+```bash
+# File: launch_nsjail.sh
+#!/bin/bash
+set -x
+mytmpfs=$(mktemp -d)
+# if something fails, try to cleanup before exiting
+function onexit {
+    rm -r "$mytmpfs"
+}
+trap onexit EXIT
+
+# ---------
+# Attempt 3: OverlayFS manually made
+#
+# Source: https://github.com/KNOXDEV/terraform-kubernetes-ctf-chal/blob/5d9b4e647f9769d08e6529ff8d48d86f98d861b3/docker-images/tunnelling/socat_entrypoint.sh#L3
+# This approach must be run before dropping caps with kctf_drop_privs. It calls that itself.
+# ---------
+# on each connection, we need to create an overlayfs for nsjail to mount to
+OUTSIDE_TEMP_DIR=$(mktemp -d)
+CHROOT_INSIDE="/tmp2" # TODO: actually just chroot to the whole overlayfs.
+mkdir "$OUTSIDE_TEMP_DIR/upper" "$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
+# this step is necessary to allow nsjail to mount the overlay once we drop privs
+chmod -R o+x "$OUTSIDE_TEMP_DIR"
+mount -t overlay overlay -o "lowerdir=/chroot,upperdir=$OUTSIDE_TEMP_DIR/upper,workdir=$OUTSIDE_TEMP_DIR/work" "$OUTSIDE_TEMP_DIR/fs"
+kctf_drop_privs kctf_pow nsjail --config /kctf/nsjail.cfg  \
+    --bindmount "${OUTSIDE_TEMP_DIR}/fs:${CHROOT_INSIDE}" \
+    --tmpfsmount /tmp \
+    --cwd "$CHROOT_INSIDE" \
+    -- /bin/bash
+    #-- /kctf/unsocat.sh
+
+```
+
+In the KNOXDEV repo, they actually just mount the overlayfs as their main chroot. That seems like a good option too, to avoid having weird paths.
 
 ## allow network access from the jail to the outside
 
