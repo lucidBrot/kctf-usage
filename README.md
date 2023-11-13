@@ -395,6 +395,24 @@ See also [my confused answer attempt on serverfault](https://serverfault.com/que
 
 The basic idea was to give every nsjail instance inside the docker a veth pair that allows connecting from inside the jail to outside, and then there using masquerading to get the request to the internet and back. This will also needs routing setup.
 
+## Setuid Bit inside nsjail
+
+Adding this to the nsjail config makes setuid binaries actually run as their owner:
+
+```
+disable_no_new_privs: true
+```
+
+More info in [docs.kernel.org](https://docs.kernel.org/userspace-api/no_new_privs.html):
+
+> Any task can set `no_new_privs`. Once the bit is set, it is inherited across fork, clone, and execve and cannot be unset. With `no_new_privs` set, `execve()` promises not to grant the privilege to do anything that could not have been done without the execve call. For example, the setuid and setgid bits will no longer change the uid or gid; file capabilities will not add to the permitted set, and LSMs will not relax constraints after execve.
+>
+> [...] Note that `no_new_privs` does not prevent privilege changes that do not involve `execve()`. An appropriately privileged task can still call `setuid(2)` and receive SCM_RIGHTS datagrams.
+>
+> [...] and `no_new_privs` + `chroot` is considerable less dangerous than chroot by itself.
+
+The last part sounds spooky though. Might want to be careful with this setting?
+
 ## get sudo to work inside nsjail
 
 This was surprisingly tricky. The hardest of the issues to figure out is probably the one about needing a user with id `1` in the jail. It must not be the current user... but it must exist. Here's a paste from my notes:
