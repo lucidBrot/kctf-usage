@@ -614,3 +614,123 @@ This means that the files will need to be accessible to `user` now, outside the 
 * Any change of ownership will reset suid bits :(
 
 In some cases, modifying all the file permissions in the right way will be just as annoying as just using the different custom user.
+
+## Capabilities
+
+While it is not necessary to know this, sooner or later you will run into it while trying to understand what nsjail is doing.
+
+My latest attempt at understanding capabilities, using [https://blog.container-solutions.com/linux-capabilities-why-they-exist-and-how-they-work](this link) and (some mental gymnastics to construct a concept that makes sense to me) follows.
+
+Other useful sources are the [capabilities man page](https://linux.die.net/man/7/capabilities) and the [setpriv man page](https://man7.org/linux/man-pages/man1/setpriv.1.html).
+
+> Refer to this while reading when you feel like it:
+>
+> ![image-20231114230121669](README.assets/image-20231114230121669.png)
+
+* Processes have the sets: Effective, Permitted, Inheritable, Ambient, Bounding
+
+* Files have the sets Permitted and Inheritable, and a single bit called the EffectiveBit.
+
+* The *Effective* set is simply what caps the current process has.
+
+  * *Permitted* capabilities become *effective* when the process makes a call to add them to the effective set.
+
+* If the current process $P$ decides to launch a new process $P'$ by executing a file $F$, that file will inherit the *Inheritable* Set ... but only those capabilities that $F$ specifies that it needs, in the file-based inheritable set.
+
+* When a new process is created, the inheritable set remains the same. It describes which caps can be inherited by new threads.
+
+* Historically, many files are not aware that capabilities are a thing, and so did not set anything up in $F$. Running such a file would not inherit anything from the Inheritable set, because the inheritable set on the file $F$ does not specify that it wants any caps.
+
+  To work around this, there is also an *Ambient* set.
+
+  * Anything in $P'(ambient)$ is automatically also in $P'(permitted)$.
+
+  * The Ambient set stays the same forever, unless the file $F$ is privileged in which case it is zeroed out. 
+
+    But then .. How does anything ever get into the ambient set then?
+
+* > There are also some important rules for adding/removing capabilities from the ambient set.
+  >
+  > * A capability can never be in a thread’s ambient set if it is not also in the inheritable *and* permitted sets.
+  > * Dropping a capability from either of those sets also removes it from the ambient set. 
+  > * Non-root threads can add capabilities from their permitted set to the ambient set, which will allow their children to also use that capability with normal files.
+
+* The *Bounding* set *limits* which capabilities a process may accumulate.
+
+  * > The bounding set is roughly intended to control which capabilities are available within a process tree.
+    >
+    > A capability can be added to the permitted set if the current thread has the CAP_SETPCAP capability and the capability is within the bounding set.
+
+* On the file $F$, if we put something in the *permitted* set of the *file*, it will put that into the permitted set of the newly launched process. Unless the bounding set forbids that (by not containing that capability).
+
+* **tricky**:
+
+  > The confusion comes when we consider that the bounding set does not control the inheritable set; you can keep capabilities in the inheritable set that are not in the bounding set. If a thread has a capability in its inherited set and executes a file with the capability in its inheritable set, the resultant process will have that capability in the permitted and effective sets, regardless of whether it exists in the bounding set.
+
+  > Removing a capability from the bounding set does not remove it from the thread's inherited set. However it does prevent the capability from being added back into the thread's inherited set in the future.
+  >
+  > (source: [man page quote on askubuntu](https://askubuntu.com/a/431598/606260))
+
+  > •   A capability can be added to the inheritable set only if
+  > it is currently present in the bounding set.
+  >
+  > •   A capability can be added to the ambient set only if it
+  > is currently present in both the permitted and
+  > inheritable sets.
+  >
+  > •   Notwithstanding the syntax offered by setpriv, the kernel
+  > does not permit capabilities to be added to the bounding
+  > set.
+  >
+  > **If you drop a capability from the bounding set without also
+  >        dropping it from the inheritable set, you are likely to become
+  >        confused. Do not do that.**
+  >
+  >
+  > [setpriv manpage](https://man7.org/linux/man-pages/man1/setpriv.1.html)
+
+  * So I think this means that when a cap is in the inheritable set, we can not get rid of it for sure simply by removing it from the bounding set...
+    ==TODO== But why is that so?
+  * On that note, notice that even if a file $F$ did not have a cap in its inheritable set, that capability will (not be in the Permitted set but will) stay in the inheritable set.
+
+* If the *effectiveBit* on the file $F$ is set, it will on launch get all caps from the  *Permitted* set into the *Effective* set.
+  Otherwise, if the effectiveBit is not set, it will only get the *Ambient* set into the *Effective* set.
+
+  * As everything in the ambient set must also be in the inheritable and permitted sets, the Ambient set is $\leq$ the Permitted set.
+
+  * ==TODO== what is the point of that? Why not always give the permitted set?
+    [This answer](https://unix.stackexchange.com/a/467501/66736) might be explaining it but i don't really get it. Something about legacy binaries that do not know how to deal with capabilities?
+
+    I guess it's basically "if effectiveBit is set, make the Permitted set effective, otherwise do nothing until the binary moves the Permitted caps by itself to the effective Set."
+
+    > A capability aware application, will start with no effective capabilities, and copy capabilities to the effective set when needed, and clear the effective set when done (reducing the harm that bugs can do).
+
+    So set the bit if the binary needs some capabilities *effective from the start*. Instead of just being allowed to make them effective.
+
+* ==TODO== do files retain their capabilities on copy?
+
+* So how do I fully get rid of a capability?
+
+  * if it is in the Ambient set, the child will still have it
+
+  * if it is in the inheritable set and the child file $F$ has it also in the (desired, if i got that right?) inheritable set, then the child will still have it in the permitted set.
+
+    * And independent of $F$ it will stay in the inheritable set further down the chain (unless explicitly removed, which a process can do!!) even if it is removed from the bounding set.
+
+  * if it is in the Permitted and Bounding Set, it stays permitted in the child. 
+
+    * If it is not in the bounding set, not in the ambient set, and not inheritable, then it will not be permitted in the child.
+
+      * And I think in this case it won't be getting it back into the permitted set, and hence also not into the ambient or effective sets.
+
+    * If it is in the bounding set, the current process will not have any advantage from it but a child [might](https://stackoverflow.com/a/43953164/2550406), by having on the file also set the inheritable and permitted set.
+
+      > yes the only way for an Inheritable capability to be promoted into the Permitted or Effective set is if the file is also marked with that capability.
+
+      implementation detail: this needs xattrs.
+
+* Dropping caps requires a cap as well, because otherwise:
+
+  > The example discussed there points out that if an unprivileged user can drop `CAP_SETUID` from the bounding set, then setuid-root programs can no longer drop privileges by changing UID from `root` to some other user.
+  >
+  > [source](https://stackoverflow.com/a/73099014/2550406)
