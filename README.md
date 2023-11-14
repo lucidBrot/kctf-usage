@@ -167,6 +167,34 @@ This is nice for a small deployment with few anticipated users, as it still has 
 
 But if you are planning to eventually use kubernetes for the CTF event, then please do first test it at least in kind, if not on the cloud already. I had the experience that GKE and Kind behave differently. E.g. I can access one challenge from another using kind, but not GKE.
 
+### Without --privileged
+
+At least in the case of one challenge, [this](https://groups.google.com/g/nsjail/c/jOq0af897eM) also worked for me:
+
+```
+docker run --security-opt seccomp=unconfined --security-opt apparmor=unconfined --cap-add SYS_ADMIN -p 1337:1337 -it $(docker build -q --target kctf-stage .) 
+```
+
+If you don't need it, you can also add `--security-opt no-new-privileges` 
+
+List of Potential Mistakes / Errors to make them googleable:
+
+* Don't put `--target kctf-stage`  unless you have a docker build target stage with that name. You can just omit it to build your full image.
+
+* If you need the new privileges capability,it might be because you use newgidmap. Then, the docker will launch correctly but nsjail will fail on connection, saying that `/usr/bin/newgidmap` failed.
+
+* If you do not state `--security-opt apparmor=unconfined` you might get at startup already `mount: /kctf/.fullproc/proc: cannot mount none read-only` if you are mounting something at startup. 
+
+* If you do not state `--security-opt seccomp=unconfined`, you will be told that
+  ```
+  [E][2023-11-14T00:18:50+0000][1] initCloneNs():435 pivot_root('/tmp/nsjail.1000.root', '/tmp/nsjail.1000.root'): Operation not permitted
+  [F][2023-11-14T00:18:50+0000][1] runChild():483 Launching child process failed
+  [W][2023-11-14T00:18:50+0000][15] runChild():503 Received error message from the child process before it has been executed
+  [E][2023-11-14T00:18:50+0000][15] standaloneMode():275 Couldn't launch the child process
+  ```
+
+  
+
 ## debug stuff inside nsjail
 
 You can specify `/bin/bash` as the command that nsjail launches. This allows you to connect to it and look around, run the commands you need to run, see how they fail.
@@ -411,7 +439,48 @@ More info in [docs.kernel.org](https://docs.kernel.org/userspace-api/no_new_priv
 >
 > [...] and `no_new_privs` + `chroot` is considerable less dangerous than chroot by itself.
 
-The last part sounds spooky though. Might want to be careful with this setting? I'm [asking on serverfault](https://serverfault.com/questions/1147799/what-makes-nsjails-disable-no-new-privs-dangerous).
+The last part sounds spooky though. Might want to be careful with this setting? I'm [asking on serverfault](https://serverfault.com/questions/1147799/what-makes-nsjails-disable-no-new-privs-dangerous). In the meantime, it makes sense to at least ensure that there are no setuid binaries owned by root, or if there are then at least that the "root" user in the jail is mapped to some non-root user outside the jail.
+
+#### Example Mapping
+
+In `nsjail.cfg`:
+
+```cfg
+uidmap [
+    {inside_id: "3777", outside_id: "1000", use_newidmap: true},
+    {inside_id: "0", outside_id: "7777", use_newidmap: true}
+]
+gidmap [
+    {inside_id: "3777", outside_id: "1000", use_newidmap: true},
+    {inside_id: "0", outside_id: "7777", use_newidmap: true}
+]
+disable_no_new_privs: true
+```
+
+In `Dockerfile`: Ensure the user with uid and gid 7777 exists. The user with id 1000 already exists in the kctf docker image from the start. I am calling my fake root user and group for inside the jail "route" in the container (outside the jail) but that is arbitrary.
+
+I also ensure that the user 1000 may map jail users to the (outside-) ids 1000 and 7777.
+
+```Dockerfile
+FROM gcr.io/kctf-docker/challenge@sha256:eb0f8c3b97460335f9820732a42702c2fa368f7d121a671c618b45bbeeadab28 as kctf-stage
+RUN apt-get install -yq --no-install-recommends uidmap &&\
+    rm -rf /var/lib/apt/lists/* &&\
+    groupadd --system --gid 7777 route &&\
+    useradd --system --no-create-home --shell /sbin/nologin --uid 7777 route --gid 7777
+COPY --from=chal / /chroot
+RUN chown --from=root:root route:route -R /chroot
+
+RUN echo "127.0.0.1 NSJAIL" >> /chroot/etc/hosts &&\
+    echo "1000:1000:1\n1000:0:1\n1000:7777:1" > /etc/subuid &&\
+    echo "1000:1000:1\n1000:0:1\n1000:7777:1" > /etc/subgid 
+    
+CMD kctf_setup && \
+    kctf_drop_privs \
+    socat \
+      TCP-LISTEN:1337,reuseaddr,fork \
+      EXEC:"/kctf/launch_nsjail.sh"
+
+```
 
 ## get sudo to work inside nsjail
 
